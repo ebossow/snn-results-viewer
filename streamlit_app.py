@@ -289,6 +289,17 @@ with st.expander("Summary metrics", expanded=False):
     else:
         st.info("Summary metrics not available for this run.")
 
+criticality_markdown = run_details.get('criticality_markdown')
+criticality_error = run_details.get('criticality_error')
+
+with st.expander("Criticality metrics", expanded=False):
+    if criticality_markdown:
+        st.markdown(criticality_markdown)
+    elif criticality_error:
+        st.error(f"Criticality metrics unavailable: {criticality_error}")
+    else:
+        st.info("Criticality metrics not available for this run.")
+
 with st.expander("Visualizations", expanded=True):
     col_raster, col_weight = st.columns(2)
     with col_raster:

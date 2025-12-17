@@ -35,9 +35,13 @@ for candidate in (THESIS_REPO_PATH, THESIS_SRC_PATH):
         sys.path.insert(0, candidate)
 
 try:  # Optional imports – available once the thesis repo is accessible
-    from analysis.util import load_run as thesis_load_run  # type: ignore
+    from analysis.util import (  # type: ignore
+        load_run as thesis_load_run,
+        combine_spikes,
+    )
 except Exception:  # pragma: no cover - optional dependency
     thesis_load_run = None
+    combine_spikes = None
 
 try:
     from analysis.summary_metrics import compute_summary_metrics  # type: ignore
@@ -46,10 +50,16 @@ except Exception:  # pragma: no cover - optional dependency
 
 try:
     from analysis.metrics import (  # type: ignore
+        average_inter_event_interval,
+        empty_bin_fraction,
+        branching_ratios_binned_global,
         build_weight_matrix,
         normalize_weight_matrix,
     )
 except Exception:  # pragma: no cover - optional dependency
+    average_inter_event_interval = None
+    empty_bin_fraction = None
+    branching_ratios_binned_global = None
     build_weight_matrix = None
     normalize_weight_matrix = None
 
@@ -173,6 +183,112 @@ def _ensure_preview_series(summary: Optional[Dict[str, Any]], data: Dict[str, An
     return np.sin(t)
 
 
+def _compute_criticality_markdown(run_dir: Path, cfg: Dict[str, Any], data: Dict[str, Any]) -> str:
+    if combine_spikes is None:
+        raise RuntimeError("combine_spikes helper unavailable")
+    if (
+        average_inter_event_interval is None
+        or empty_bin_fraction is None
+        or branching_ratios_binned_global is None
+    ):
+        raise RuntimeError("Criticality metrics dependencies are missing")
+
+    experiment_cfg = cfg.get("experiment") if isinstance(cfg, dict) else None
+    stimulation_cfg = cfg.get("stimulation", {}) if isinstance(cfg, dict) else {}
+    if not experiment_cfg:
+        raise ValueError("Experiment configuration missing")
+
+    simtime_ms = float(experiment_cfg.get("simtime_ms", 0.0))
+    t_start_ms = 0.0
+    t_stop_ms = simtime_ms
+
+    pattern_cfg = stimulation_cfg.get("pattern", {}) if isinstance(stimulation_cfg, dict) else {}
+    dc_cfg = stimulation_cfg.get("dc", {}) if isinstance(stimulation_cfg, dict) else {}
+    dc_enabled = bool(dc_cfg.get("enabled", False))
+
+    if dc_enabled:
+        t_off_val = pattern_cfg.get("t_off_ms")
+        if t_off_val is None:
+            t_off_val = dc_cfg.get("t_off_ms", t_stop_ms)
+        t_off_ms = float(t_off_val)
+        t_start_ms = min(max(t_off_ms, 0.0), t_stop_ms)
+
+    spikes_all = combine_spikes(
+        data,
+        ["spikes_E", "spikes_IH", "spikes_IA"],
+    )
+    if not spikes_all:
+        raise ValueError("Spike data not available for criticality metrics")
+
+    times_full = np.asarray(spikes_all.get("times"))
+    senders_full = np.asarray(spikes_all.get("senders"))
+    if times_full.size == 0 or senders_full.size == 0:
+        raise ValueError("Spike data empty for selected window")
+
+    mask = (times_full >= t_start_ms) & (times_full <= t_stop_ms)
+    times = times_full[mask]
+
+    if times.size < 2:
+        raise ValueError("Not enough spikes within analysis window")
+
+    net_cfg = cfg.get("network", {})
+    N_total = int(
+        net_cfg.get("N_E", 0)
+        + net_cfg.get("N_IH", 0)
+        + net_cfg.get("N_IA_1", net_cfg.get("N_IA", 0))
+        + net_cfg.get("N_IA_2", 0)
+    )
+
+    aiei_ms, _ = average_inter_event_interval(
+        times_ms=times,
+        t_start_ms=t_start_ms,
+        t_stop_ms=t_stop_ms,
+    )
+
+    if not np.isfinite(aiei_ms) or aiei_ms <= 0.0:
+        raise ValueError("Average inter-event interval is not defined")
+
+    dt_factors = np.array([0.5, 1.0, 2.0], dtype=float)
+    dt_min_ms = 2.0
+
+    lines = [
+        f"**Run dir:** `{run_dir}`",
+        f"**Time window (ms):** ({t_start_ms:.1f}, {t_stop_ms:.1f})",
+        f"**N_total:** {N_total}",
+        f"**AIEI (ms):** {aiei_ms:.3f}",
+        "**dt factors:** " + ", ".join(f"{f:.2f}" for f in dt_factors),
+        "",
+        "| dt/AIEI | dt (ms) | p0(dt) | sigma_global |",
+        "|--------|---------|--------|--------------|",
+    ]
+
+    for factor in dt_factors:
+        dt_raw = factor * aiei_ms
+        dt_ms = float(max(dt_raw, dt_min_ms))
+
+        p0 = empty_bin_fraction(
+            times_ms=times,
+            t_start_ms=t_start_ms,
+            t_stop_ms=t_stop_ms,
+            dt_ms=dt_ms,
+        )
+
+        sigma_binned, _, _ = branching_ratios_binned_global(
+            times_ms=times,
+            t_start_ms=t_start_ms,
+            t_stop_ms=t_stop_ms,
+            dt_ms=dt_ms,
+            min_aval_len=2,
+        )
+
+        dt_over_aiei = dt_ms / aiei_ms
+        lines.append(
+            f"| {dt_over_aiei:6.3f} | {dt_ms:7.3f} | {p0:6.3f} | {sigma_binned:12.3f} |"
+        )
+
+    return "\n".join(lines)
+
+
 def load_run(run_path: str | None = None) -> Dict[str, Any]:
     """Load config, spikes, weights, and summary metrics for a run."""
     run_dir = Path(run_path) if run_path else None
@@ -242,37 +358,41 @@ def load_run(run_path: str | None = None) -> Dict[str, Any]:
     weight_matrix_error: Optional[str] = None
     network_cfg = cfg.get("network") if isinstance(cfg, dict) else None
     expected_weight_keys = {"sources", "targets", "weights"}
-    if (
-        weights_final
-        and network_cfg
-        and build_weight_matrix is not None
-        and normalize_weight_matrix is not None
-    ):
-        if isinstance(weights_final, dict) and expected_weight_keys.issubset(weights_final.keys()):
-            try:
-                required_keys = {"N_E", "N_IH", "N_IA_1", "N_IA_2"}
-                if not required_keys.issubset(network_cfg.keys()):
-                    raise KeyError("Missing network sizes required for weight matrix")
+    if weights_final:
+        if (
+            network_cfg
+            and build_weight_matrix is not None
+            and normalize_weight_matrix is not None
+        ):
+            if isinstance(weights_final, dict) and expected_weight_keys.issubset(weights_final.keys()):
+                try:
+                    required_keys = {"N_E", "N_IH", "N_IA_1", "N_IA_2"}
+                    if not required_keys.issubset(network_cfg.keys()):
+                        raise KeyError("Missing network sizes required for weight matrix")
 
-                sources = weights_final.get("sources")
-                targets = weights_final.get("targets")
-                weights_vals = weights_final.get("weights")
+                    sources = weights_final.get("sources")
+                    targets = weights_final.get("targets")
+                    weights_vals = weights_final.get("weights")
 
-                if sources is not None and targets is not None and weights_vals is not None:
-                    N_total = (
-                        int(network_cfg["N_E"])
-                        + int(network_cfg["N_IH"])
-                        + int(network_cfg["N_IA_1"])
-                        + int(network_cfg["N_IA_2"])
-                    )
-                    dense = build_weight_matrix(sources, targets, weights_vals, N_total)
-                    weight_matrix = normalize_weight_matrix(dense, cfg)
-            except Exception as exc:  # pragma: no cover - diagnostics only
-                weight_matrix_error = str(exc)
+                    if sources is not None and targets is not None and weights_vals is not None:
+                        N_total = (
+                            int(network_cfg["N_E"])
+                            + int(network_cfg["N_IH"])
+                            + int(network_cfg["N_IA_1"])
+                            + int(network_cfg["N_IA_2"])
+                        )
+                        dense = build_weight_matrix(sources, targets, weights_vals, N_total)
+                        weight_matrix = normalize_weight_matrix(dense, cfg)
+                except Exception as exc:  # pragma: no cover - diagnostics only
+                    weight_matrix_error = str(exc)
+            else:
+                weight_matrix_error = (
+                    "Weights stored in unsupported legacy format. "
+                    "Please regenerate the run with the updated exporter."
+                )
         else:
             weight_matrix_error = (
-                "Weights stored in unsupported legacy format. "
-                "Please regenerate the run with the updated exporter."
+                "Weight matrix helpers unavailable or weight data missing"
             )
 
     summary: Optional[Dict[str, Any]] = None
@@ -283,6 +403,14 @@ def load_run(run_path: str | None = None) -> Dict[str, Any]:
             summary = {"error": str(exc)}
 
     preview_series = _ensure_preview_series(summary, data)
+
+    criticality_markdown: Optional[str] = None
+    criticality_error: Optional[str] = None
+    if cfg and data:
+        try:
+            criticality_markdown = _compute_criticality_markdown(run_dir, cfg, data)
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            criticality_error = str(exc)
 
     return {
         "config": cfg,
@@ -295,6 +423,8 @@ def load_run(run_path: str | None = None) -> Dict[str, Any]:
         "preview_series": preview_series,
         "weight_matrix": weight_matrix,
         "weight_matrix_error": weight_matrix_error,
+        "criticality_markdown": criticality_markdown,
+        "criticality_error": criticality_error,
     }
 
 
