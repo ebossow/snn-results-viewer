@@ -185,6 +185,29 @@ def render_weight_matrix(matrix: Any, cfg: Dict[str, Any], error: str | None) ->
     st.pyplot(fig)
 
 
+def render_mr_regression(plot_data: Dict[str, Any]) -> None:
+    time_ms = np.asarray(plot_data.get("time_ms"))
+    rk = np.asarray(plot_data.get("rk"))
+    fit_vals = np.asarray(plot_data.get("fit"))
+    title = plot_data.get("title") or "MR regression"
+
+    if time_ms.size == 0 or rk.size == 0:
+        st.info("MR regression data unavailable for this run.")
+        return
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(time_ms, rk, "o", label=r"$r_k$")
+    if fit_vals.size:
+        ax.plot(time_ms, fit_vals, "-", label="MR fit")
+    ax.set_xlabel("Lag (ms)")
+    ax.set_ylabel(r"Correlation $r_k$")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    st.pyplot(fig)
+
+
 st.title("SNN Results Viewer")
 
 default_results_root = str(Path(loader.THESIS_REPO_PATH) / "results")
@@ -291,10 +314,23 @@ with st.expander("Summary metrics", expanded=False):
 
 criticality_markdown = run_details.get('criticality_markdown')
 criticality_error = run_details.get('criticality_error')
+criticality_mr_plot = run_details.get('criticality_mr_regression')
 
 with st.expander("Criticality metrics", expanded=False):
     if criticality_markdown:
-        st.markdown(criticality_markdown)
+        if criticality_mr_plot:
+            table_col, plot_col = st.columns((3, 2))
+            with table_col:
+                st.markdown(criticality_markdown)
+            with plot_col:
+                dt_ms = criticality_mr_plot.get("dt_ms") if isinstance(criticality_mr_plot, dict) else None
+                if isinstance(dt_ms, (int, float)) and np.isfinite(dt_ms):
+                    st.markdown(f"#### MR regression (dt = {dt_ms:.1f} ms)")
+                else:
+                    st.markdown("#### MR regression")
+                render_mr_regression(criticality_mr_plot)
+        else:
+            st.markdown(criticality_markdown)
     elif criticality_error:
         st.error(f"Criticality metrics unavailable: {criticality_error}")
     else:

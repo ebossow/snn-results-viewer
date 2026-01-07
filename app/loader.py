@@ -11,13 +11,21 @@ available we fall back to a deterministic stub so the UI continues to render.
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import yaml
+
+# Parameters for MR regression plot (dt configurable via env; default 1 ms).
+MR_DEFAULT_DT_MS = float(os.environ.get("SNN_RESULTS_VIEWER_MR_DT_MS", "1.0"))
+MR_FIT_MIN_MS = 10.0
+MR_FIT_MAX_MS = 60.0
+MR_MIN_FIT_POINTS = 3
+MR_FIT_USE_OFFSET = True
 
 # Path to your thesis codebase (source of truth for data/analysis).
 # Override via the SNN_RESULTS_VIEWER_THESIS_PATH environment variable when
@@ -53,6 +61,8 @@ try:
         average_inter_event_interval,
         empty_bin_fraction,
         branching_ratios_binned_global,
+        branching_ratio_mr_estimator,
+        MRESTIMATOR_AVAILABLE,
         build_weight_matrix,
         normalize_weight_matrix,
     )
@@ -60,6 +70,8 @@ except Exception:  # pragma: no cover - optional dependency
     average_inter_event_interval = None
     empty_bin_fraction = None
     branching_ratios_binned_global = None
+    branching_ratio_mr_estimator = None
+    MRESTIMATOR_AVAILABLE = False
     build_weight_matrix = None
     normalize_weight_matrix = None
 
@@ -183,7 +195,12 @@ def _ensure_preview_series(summary: Optional[Dict[str, Any]], data: Dict[str, An
     return np.sin(t)
 
 
-def _compute_criticality_markdown(run_dir: Path, cfg: Dict[str, Any], data: Dict[str, Any]) -> str:
+def _compute_criticality_report(
+    run_dir: Path,
+    cfg: Dict[str, Any],
+    data: Dict[str, Any],
+    mr_dt_ms: Optional[float] = None,
+) -> Tuple[str, Optional[Dict[str, Any]]]:
     if combine_spikes is None:
         raise RuntimeError("combine_spikes helper unavailable")
     if (
@@ -249,7 +266,10 @@ def _compute_criticality_markdown(run_dir: Path, cfg: Dict[str, Any], data: Dict
         raise ValueError("Average inter-event interval is not defined")
 
     dt_factors = np.array([0.5, 1.0, 2.0], dtype=float)
-    dt_min_ms = 2.0
+    dt_min_ms = 1.0
+    effective_mr_dt = float(mr_dt_ms if mr_dt_ms is not None else MR_DEFAULT_DT_MS)
+    if effective_mr_dt <= 0.0:
+        effective_mr_dt = MR_DEFAULT_DT_MS
 
     lines = [
         f"**Run dir:** `{run_dir}`",
@@ -257,15 +277,49 @@ def _compute_criticality_markdown(run_dir: Path, cfg: Dict[str, Any], data: Dict
         f"**N_total:** {N_total}",
         f"**AIEI (ms):** {aiei_ms:.3f}",
         "**dt factors:** " + ", ".join(f"{f:.2f}" for f in dt_factors),
-        "",
-        "| dt/AIEI | dt (ms) | p0(dt) | sigma_global |",
-        "|--------|---------|--------|--------------|",
     ]
+    mr_available = bool(MRESTIMATOR_AVAILABLE and branching_ratio_mr_estimator is not None)
+    if mr_available:
+        lines.append("**MR estimator:** available")
+    else:
+        lines.append("**MR estimator:** unavailable (install 'mrestimator')")
+    lines.append(f"**MR dt (ms):** {effective_mr_dt:.3f}")
 
+    lines.extend(
+        [
+            "",
+            "| dt/AIEI | dt (ms) | p0(dt) | sigma_global | sigma_MR | tau_MR (ms) |",
+            "|--------|---------|--------|--------------|----------|-------------|",
+        ]
+    )
+
+    dt_candidates: List[float] = []
     for factor in dt_factors:
-        dt_raw = factor * aiei_ms
-        dt_ms = float(max(dt_raw, dt_min_ms))
+        dt_raw = float(factor * aiei_ms)
+        dt_candidates.append(max(dt_raw, dt_min_ms))
+    # Allow dedicated MR plot dt (1 ms) even if below dt_min.
+    final_dt_values: List[float] = []
 
+    def _append_unique(value: float) -> None:
+        if value <= 0:
+            return
+        if not any(
+            math.isclose(value, existing, rel_tol=1e-9, abs_tol=1e-9)
+            for existing in final_dt_values
+        ):
+            final_dt_values.append(value)
+
+    for value in dt_candidates:
+        _append_unique(value)
+
+    _append_unique(effective_mr_dt)
+
+    def _fmt_or_na(value: float) -> str:
+        return f"{value:.3f}" if np.isfinite(value) else "n/a"
+
+    mr_plot_payload: Optional[Dict[str, Any]] = None
+
+    for dt_ms in final_dt_values:
         p0 = empty_bin_fraction(
             times_ms=times,
             t_start_ms=t_start_ms,
@@ -273,7 +327,7 @@ def _compute_criticality_markdown(run_dir: Path, cfg: Dict[str, Any], data: Dict
             dt_ms=dt_ms,
         )
 
-        sigma_binned, _, _ = branching_ratios_binned_global(
+        sigma_binned, _, counts = branching_ratios_binned_global(
             times_ms=times,
             t_start_ms=t_start_ms,
             t_stop_ms=t_stop_ms,
@@ -281,15 +335,76 @@ def _compute_criticality_markdown(run_dir: Path, cfg: Dict[str, Any], data: Dict
             min_aval_len=2,
         )
 
+        sigma_mr = np.nan
+        tau_mr = np.nan
+        coeffs = None
+        fit_result = None
+        wants_plot_details = mr_available and math.isclose(dt_ms, effective_mr_dt, rel_tol=1e-9, abs_tol=1e-9)
+        if mr_available and wants_plot_details:
+            try:
+                result = branching_ratio_mr_estimator(
+                    spike_counts=counts,
+                    dt_ms=dt_ms,
+                    fit_lag_ms_min=MR_FIT_MIN_MS,
+                    fit_lag_ms_max=MR_FIT_MAX_MS,
+                    fit_use_offset=MR_FIT_USE_OFFSET,
+                    min_fit_points=MR_MIN_FIT_POINTS,
+                    return_details=wants_plot_details,
+                )
+                if wants_plot_details:
+                    sigma_mr, tau_mr, coeffs, fit_result = result  # type: ignore[assignment]
+                else:
+                    sigma_mr, tau_mr = result  # type: ignore[misc]
+            except Exception:
+                sigma_mr = np.nan
+                tau_mr = np.nan
+                coeffs = None
+                fit_result = None
+        elif mr_available:
+            # Skip MR computation for other dt values
+            sigma_mr = np.nan
+            tau_mr = np.nan
+
         dt_over_aiei = dt_ms / aiei_ms
         lines.append(
-            f"| {dt_over_aiei:6.3f} | {dt_ms:7.3f} | {p0:6.3f} | {sigma_binned:12.3f} |"
+            "| {dt_over_aiei:6.3f} | {dt_ms:7.3f} | {p0:6.3f} | {sigma:12.3f} | {sigma_mr:>8} | {tau_mr:>11} |".format(
+                dt_over_aiei=dt_over_aiei,
+                dt_ms=dt_ms,
+                p0=p0,
+                sigma=sigma_binned,
+                sigma_mr=_fmt_or_na(sigma_mr),
+                tau_mr=_fmt_or_na(tau_mr),
+            )
         )
 
-    return "\n".join(lines)
+        if wants_plot_details and coeffs is not None and fit_result is not None and mr_plot_payload is None:
+            steps = np.asarray(getattr(coeffs, "steps", []), dtype=float)
+            coeff_vals = np.asarray(getattr(coeffs, "coefficients", []), dtype=float)
+            dt_coeff = float(getattr(coeffs, "dt", dt_ms))
+            time_ms = steps * dt_coeff
+            fitfunc = getattr(fit_result, "fitfunc", None)
+            params = getattr(fit_result, "popt", None)
+            if callable(fitfunc) and params is not None:
+                try:
+                    fit_vals = fitfunc(steps, *params)
+                except Exception:
+                    fit_vals = np.full_like(time_ms, np.nan)
+            else:
+                fit_vals = np.full_like(time_ms, np.nan)
+
+            if time_ms.size and coeff_vals.size:
+                mr_plot_payload = {
+                    "dt_ms": dt_ms,
+                    "time_ms": time_ms,
+                    "rk": coeff_vals,
+                    "fit": fit_vals,
+                    "title": f"MR regression (dt={dt_ms:.3f} ms)",
+                }
+
+    return "\n".join(lines), mr_plot_payload
 
 
-def load_run(run_path: str | None = None) -> Dict[str, Any]:
+def load_run(run_path: str | None = None, *, mr_dt_ms: Optional[float] = None) -> Dict[str, Any]:
     """Load config, spikes, weights, and summary metrics for a run."""
     run_dir = Path(run_path) if run_path else None
     if run_dir is None or not run_dir.exists():
@@ -405,10 +520,16 @@ def load_run(run_path: str | None = None) -> Dict[str, Any]:
     preview_series = _ensure_preview_series(summary, data)
 
     criticality_markdown: Optional[str] = None
+    criticality_mr_plot: Optional[Dict[str, Any]] = None
     criticality_error: Optional[str] = None
     if cfg and data:
         try:
-            criticality_markdown = _compute_criticality_markdown(run_dir, cfg, data)
+            criticality_markdown, criticality_mr_plot = _compute_criticality_report(
+                run_dir,
+                cfg,
+                data,
+                mr_dt_ms=mr_dt_ms,
+            )
         except Exception as exc:  # pragma: no cover - diagnostics only
             criticality_error = str(exc)
 
@@ -424,6 +545,7 @@ def load_run(run_path: str | None = None) -> Dict[str, Any]:
         "weight_matrix": weight_matrix,
         "weight_matrix_error": weight_matrix_error,
         "criticality_markdown": criticality_markdown,
+        "criticality_mr_regression": criticality_mr_plot,
         "criticality_error": criticality_error,
     }
 
