@@ -25,7 +25,7 @@ MR_DEFAULT_DT_MS = float(os.environ.get("SNN_RESULTS_VIEWER_MR_DT_MS", "1.0"))
 MR_FIT_MIN_MS = 10.0
 MR_FIT_MAX_MS = 60.0
 MR_MIN_FIT_POINTS = 3
-MR_FIT_USE_OFFSET = True
+MR_FIT_USE_OFFSET = False
 
 # Path to your thesis codebase (source of truth for data/analysis).
 # Override via the SNN_RESULTS_VIEWER_THESIS_PATH environment variable when
