@@ -15,6 +15,43 @@ from app import loader, ui
 
 st.set_page_config(page_title="SNN Results Viewer", layout="wide")
 
+st.markdown(
+    """
+    <style>
+    .run-nav-marker { display: none; }
+    div:has(> .run-nav-marker) {
+        position: fixed;
+        top: 1rem;
+        right: 1rem;
+        z-index: 1000;
+        width: 240px;
+        padding: 0.5rem 0.75rem;
+        border-radius: 0.75rem;
+        background: rgba(10, 12, 20, 0.9);
+        backdrop-filter: blur(6px);
+        box-shadow: 0 0.75rem 1.5rem rgba(0, 0, 0, 0.35);
+    }
+    div:has(> .run-nav-marker) .stButton>button {
+        width: 100%;
+        border-radius: 999px;
+        font-weight: 600;
+    }
+    div:has(> .run-nav-marker) .stHorizontalBlock {
+        gap: 0.5rem;
+    }
+    @media (max-width: 800px) {
+        div:has(> .run-nav-marker) {
+            width: calc(100% - 2.5rem);
+            left: 1.25rem;
+            right: 1.25rem;
+            top: 0.5rem;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 def _trigger_rerun() -> None:
     """Call the modern rerun API with a fallback for older Streamlit versions."""
@@ -283,8 +320,35 @@ run_options = [
     for r in runs_in_exp
 ]
 run_labels = [opt["label"] for opt in run_options]
-selected_label = st.selectbox("Run", run_labels)
-selected_run_info = next(opt["info"] for opt in run_options if opt["label"] == selected_label)
+
+if "selected_run_label" not in st.session_state or st.session_state["selected_run_label"] not in run_labels:
+    st.session_state["selected_run_label"] = run_labels[0]
+
+current_index = run_labels.index(st.session_state["selected_run_label"])
+selected_label = st.selectbox("Run", run_labels, index=current_index)
+if selected_label != st.session_state["selected_run_label"]:
+    st.session_state["selected_run_label"] = selected_label
+
+run_index = run_labels.index(selected_label)
+prev_run = run_options[run_index - 1] if run_index > 0 else None
+next_run = run_options[run_index + 1] if run_index + 1 < len(run_options) else None
+
+nav_container = st.container()
+with nav_container:
+    st.markdown("<div class=\"run-nav-marker\"></div>", unsafe_allow_html=True)
+    prev_col, next_col = st.columns(2, gap="small")
+    prev_disabled = prev_run is None
+    next_disabled = next_run is None
+    if prev_col.button("← Previous", disabled=prev_disabled):
+        if prev_run:
+            st.session_state["selected_run_label"] = prev_run["label"]
+            _trigger_rerun()
+    if next_col.button("Next →", disabled=next_disabled):
+        if next_run:
+            st.session_state["selected_run_label"] = next_run["label"]
+            _trigger_rerun()
+
+selected_run_info = run_options[run_index]["info"]
 
 run_details = loader.load_run(selected_run_info['path'])
 metadata = run_details.get('metadata') or {}
