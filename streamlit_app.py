@@ -410,6 +410,11 @@ config = run_details.get('config') or {}
 summary = run_details.get('summary') or {}
 data = run_details.get('data') or {}
 
+debug_avalanche = run_details.get('avalanche_analysis') or {}
+st.sidebar.caption(
+    f"Debug DCC (loader): {debug_avalanche.get('dcc', 'n/a')}"
+)
+
 with st.expander("Run overview", expanded=True):
     col_a, col_b, col_c = st.columns(3)
     col_a.metric("Experiment", selected_experiment)

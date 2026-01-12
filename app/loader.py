@@ -14,11 +14,20 @@ from __future__ import annotations
 import math
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import yaml
+
+try:
+    import powerlaw  # type: ignore
+
+    POWERLAW_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    powerlaw = None
+    POWERLAW_AVAILABLE = False
 
 # Parameters for MR regression plot (dt configurable via env; default 1 ms).
 MR_DEFAULT_DT_MS = float(os.environ.get("SNN_RESULTS_VIEWER_MR_DT_MS", "1.0"))
@@ -195,6 +204,68 @@ def _ensure_preview_series(summary: Optional[Dict[str, Any]], data: Dict[str, An
     # deterministic stub fallback
     t = np.linspace(0, 2 * np.pi, 200)
     return np.sin(t)
+
+
+def _fit_powerlaw_exponent(values: np.ndarray, discrete: bool = True) -> float:
+    if not POWERLAW_AVAILABLE or values is None:
+        return float("nan")
+    vals = np.asarray(values, float)
+    vals = vals[vals > 0]
+    if vals.size < 5:
+        return float("nan")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            fit = powerlaw.Fit(vals, verbose=False, discrete=discrete)  # type: ignore[arg-type]
+        except Exception:
+            return float("nan")
+    return float(getattr(fit.power_law, "alpha", float("nan")))
+
+
+def _fit_gamma_exponent(sizes: np.ndarray, durations: np.ndarray) -> float:
+    size_arr = np.asarray(sizes, float)
+    duration_arr = np.asarray(durations, float)
+    mask = (size_arr > 0.0) & (duration_arr > 0.0)
+    if np.count_nonzero(mask) < 2:
+        return float("nan")
+
+    # Match thesis script: regress log mean size per duration bin vs. log duration.
+    filtered_sizes = size_arr[mask]
+    filtered_durations = duration_arr[mask]
+    duration_unique, inverse = np.unique(filtered_durations, return_inverse=True)
+    mean_sizes = np.zeros_like(duration_unique)
+    counts = np.zeros_like(duration_unique)
+    np.add.at(mean_sizes, inverse, filtered_sizes)
+    np.add.at(counts, inverse, 1.0)
+    valid = counts > 0
+    if np.count_nonzero(valid) < 2:
+        return float("nan")
+    mean_sizes[valid] /= counts[valid]
+
+    log_d = np.log(duration_unique[valid])
+    log_s = np.log(mean_sizes[valid])
+    if np.allclose(log_d, log_d[0]):
+        return float("nan")
+    try:
+        slope, _ = np.polyfit(log_d, log_s, 1)
+    except Exception:
+        return float("nan")
+    return float(slope)
+
+
+def _compute_gamma_pred(tau_size: float, tau_duration: float) -> float:
+    if not np.isfinite(tau_size) or not np.isfinite(tau_duration):
+        return float("nan")
+    if abs(tau_duration - 1.0) < 1e-9:
+        return float("nan")
+    return float((tau_size - 1.0) / (tau_duration - 1.0))
+
+
+def _compute_dcc(tau_size: float, tau_duration: float, gamma_fitted: float) -> Tuple[float, float]:
+    gamma_pred = _compute_gamma_pred(tau_size, tau_duration)
+    if not np.isfinite(gamma_pred) or not np.isfinite(gamma_fitted):
+        return float("nan"), gamma_pred
+    return float(abs(gamma_pred - gamma_fitted)), gamma_pred
 
 
 def _prepare_analysis_inputs(
@@ -435,7 +506,7 @@ def _compute_avalanche_analysis(
     data: Dict[str, Any],
     *,
     dt_ms: Optional[float] = None,
-    min_size: int = 2,
+    min_size: int = 1,
     analysis_inputs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if avalanche_sizes_from_times is None:
@@ -457,6 +528,8 @@ def _compute_avalanche_analysis(
         raise ValueError("Average inter-event interval unavailable for avalanche analysis")
 
     bin_width_ms = float(dt_ms) if dt_ms and dt_ms > 0.0 else max(aiei_ms, 1e-3)
+    print(f" LOL Avalanche analysis using bin width dt = {bin_width_ms:.3f} ms", file=sys.stderr)
+
 
     sizes, durations_ms = avalanche_sizes_from_times(
         times_ms=times,
@@ -477,22 +550,13 @@ def _compute_avalanche_analysis(
         survival = survival_counts / float(survival_counts[0])
         return unique_vals, survival
 
-    def _fit_exponent(x: np.ndarray, y: np.ndarray) -> float:
-        mask = (x > 0.0) & (y > 0.0)
-        if np.count_nonzero(mask) < 2:
-            return float("nan")
-        logx = np.log10(x[mask])
-        logy = np.log10(y[mask])
-        try:
-            slope, _ = np.polyfit(logx, logy, 1)
-        except Exception:
-            return float("nan")
-        return 1.0 - slope
-
     size_x, size_ccdf = _ccdf(sizes)
     duration_x, duration_ccdf = _ccdf(durations_ms)
-    tau = _fit_exponent(size_x, size_ccdf)
-    alpha = _fit_exponent(duration_x, duration_ccdf)
+
+    tau_size = _fit_powerlaw_exponent(sizes)
+    tau_duration = _fit_powerlaw_exponent(durations_ms)
+    beta_emp = _fit_gamma_exponent(sizes, durations_ms)
+    dcc, beta_pred = _compute_dcc(tau_size, tau_duration, beta_emp)
 
     duration_unique, inverse_indices = np.unique(durations_ms, return_inverse=True)
     mean_sizes = np.zeros_like(duration_unique)
@@ -503,23 +567,6 @@ def _compute_avalanche_analysis(
     valid = counts_per_duration > 0
     mean_sizes[valid] /= counts_per_duration[valid]
 
-    def _fit_beta(x_vals: np.ndarray, y_vals: np.ndarray) -> float:
-        mask = (x_vals > 0.0) & (y_vals > 0.0)
-        if np.count_nonzero(mask) < 2:
-            return float("nan")
-        logx = np.log10(x_vals[mask])
-        logy = np.log10(y_vals[mask])
-        try:
-            slope, _ = np.polyfit(logx, logy, 1)
-        except Exception:
-            return float("nan")
-        return float(slope)
-
-    beta_emp = _fit_beta(duration_unique, mean_sizes)
-    beta_pred = float("nan")
-    if np.isfinite(alpha) and np.isfinite(tau) and not math.isclose(tau, 1.0, rel_tol=1e-9):
-        beta_pred = (alpha - 1.0) / (tau - 1.0)
-
     mask_scale = (duration_unique > 0.0) & (mean_sizes > 0.0)
     predicted_sizes = np.full_like(mean_sizes, np.nan)
     if np.isfinite(beta_pred) and np.any(mask_scale):
@@ -528,12 +575,10 @@ def _compute_avalanche_analysis(
         intercept = float(np.mean(logy - beta_pred * logx))
         predicted_sizes[mask_scale] = np.exp(intercept + beta_pred * logx)
 
-    dcc = abs(beta_emp - beta_pred) if np.isfinite(beta_emp) and np.isfinite(beta_pred) else float("nan")
-
     return {
         "dt_ms": float(bin_width_ms),
-        "tau": float(tau),
-        "alpha": float(alpha),
+        "tau": float(tau_size),
+        "alpha": float(tau_duration),
         "beta_empirical": float(beta_emp),
         "beta_predicted": float(beta_pred),
         "dcc": float(dcc),
