@@ -245,6 +245,60 @@ def render_mr_regression(plot_data: Dict[str, Any]) -> None:
     st.pyplot(fig)
 
 
+def render_avalanche_analysis(analysis: Dict[str, Any]) -> None:
+    size_ccdf = analysis.get("size_ccdf") or {}
+    duration_ccdf = analysis.get("duration_ccdf") or {}
+    scaling = analysis.get("scaling") or {}
+
+    size_x = np.asarray(size_ccdf.get("x", []), dtype=float)
+    size_y = np.asarray(size_ccdf.get("y", []), dtype=float)
+    duration_x = np.asarray(duration_ccdf.get("x", []), dtype=float)
+    duration_y = np.asarray(duration_ccdf.get("y", []), dtype=float)
+    scaling_x = np.asarray(scaling.get("duration_ms", []), dtype=float)
+    scaling_mean = np.asarray(scaling.get("mean_size", []), dtype=float)
+    scaling_pred = np.asarray(scaling.get("predicted", []), dtype=float)
+
+    if size_x.size == 0 or duration_x.size == 0 or scaling_x.size == 0:
+        st.info("Avalanche statistics unavailable for plotting.")
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    axes[0].plot(size_x, size_y, "o-", color="#d62728")
+    axes[0].set_xscale("log")
+    axes[0].set_yscale("log")
+    axes[0].set_xlabel("Avalanche size S (spikes)")
+    axes[0].set_ylabel("P(S' ≥ S)")
+    axes[0].set_title("Size distribution")
+
+    axes[1].plot(duration_x, duration_y, "o-", color="#1f77b4")
+    axes[1].set_xscale("log")
+    axes[1].set_yscale("log")
+    axes[1].set_xlabel("Avalanche duration D (ms)")
+    axes[1].set_ylabel("P(D' ≥ D)")
+    axes[1].set_title("Duration distribution")
+
+    axes[2].scatter(scaling_x, scaling_mean, s=30, color="#9467bd", label="⟨S⟩ | D")
+    axes[2].set_xscale("log")
+    axes[2].set_yscale("log")
+    pred_mask = np.isfinite(scaling_pred) & (scaling_x > 0.0)
+    if np.any(pred_mask):
+        axes[2].plot(
+            scaling_x[pred_mask],
+            scaling_pred[pred_mask],
+            color="#2ca02c",
+            linewidth=2,
+            label="Predicted β",
+        )
+    axes[2].set_xlabel("Duration D (ms)")
+    axes[2].set_ylabel("Mean size ⟨S⟩")
+    axes[2].set_title("Scaling relation")
+    axes[2].legend()
+
+    fig.tight_layout()
+    st.pyplot(fig)
+
+
 st.title("SNN Results Viewer")
 
 default_results_root = str(Path(loader.THESIS_REPO_PATH) / "results")
@@ -379,6 +433,8 @@ with st.expander("Summary metrics", expanded=False):
 criticality_markdown = run_details.get('criticality_markdown')
 criticality_error = run_details.get('criticality_error')
 criticality_mr_plot = run_details.get('criticality_mr_regression')
+avalanche_analysis = run_details.get('avalanche_analysis')
+avalanche_error = run_details.get('avalanche_error')
 
 with st.expander("Criticality metrics", expanded=False):
     if criticality_markdown:
@@ -399,6 +455,32 @@ with st.expander("Criticality metrics", expanded=False):
         st.error(f"Criticality metrics unavailable: {criticality_error}")
     else:
         st.info("Criticality metrics not available for this run.")
+
+with st.expander("Avalanche analysis", expanded=False):
+    if avalanche_analysis:
+        def _fmt_val(value: Any) -> str:
+            try:
+                num = float(value)
+            except (TypeError, ValueError):
+                return "n/a"
+            return f"{num:.3f}" if np.isfinite(num) else "n/a"
+
+        metrics_row = st.columns(6)
+        metrics_row[0].metric("τ (size)", _fmt_val(avalanche_analysis.get('tau', np.nan)))
+        metrics_row[1].metric("α (duration)", _fmt_val(avalanche_analysis.get('alpha', np.nan)))
+        metrics_row[2].metric("β₍emp₎", _fmt_val(avalanche_analysis.get('beta_empirical', np.nan)))
+        metrics_row[3].metric("β₍pred₎", _fmt_val(avalanche_analysis.get('beta_predicted', np.nan)))
+        metrics_row[4].metric("DCC", _fmt_val(avalanche_analysis.get('dcc', np.nan)))
+        metrics_row[5].metric("dt (ms)", _fmt_val(avalanche_analysis.get('dt_ms', np.nan)))
+        st.caption(
+            "DCC = |β₍emp₎ − β₍pred₎| highlights how far the avalanche size-duration scaling"
+            " deviates from the critical prediction β = (α − 1)/(τ − 1)."
+        )
+        render_avalanche_analysis(avalanche_analysis)
+    elif avalanche_error:
+        st.error(f"Avalanche analysis unavailable: {avalanche_error}")
+    else:
+        st.info("Avalanche analysis not available for this run.")
 
 with st.expander("Visualizations", expanded=True):
     col_raster, col_weight = st.columns(2)

@@ -62,6 +62,7 @@ try:
         empty_bin_fraction,
         branching_ratios_binned_global,
         branching_ratio_mr_estimator,
+        avalanche_sizes_from_times,
         MRESTIMATOR_AVAILABLE,
         build_weight_matrix,
         normalize_weight_matrix,
@@ -71,6 +72,7 @@ except Exception:  # pragma: no cover - optional dependency
     empty_bin_fraction = None
     branching_ratios_binned_global = None
     branching_ratio_mr_estimator = None
+    avalanche_sizes_from_times = None
     MRESTIMATOR_AVAILABLE = False
     build_weight_matrix = None
     normalize_weight_matrix = None
@@ -195,20 +197,12 @@ def _ensure_preview_series(summary: Optional[Dict[str, Any]], data: Dict[str, An
     return np.sin(t)
 
 
-def _compute_criticality_report(
-    run_dir: Path,
+def _prepare_analysis_inputs(
     cfg: Dict[str, Any],
     data: Dict[str, Any],
-    mr_dt_ms: Optional[float] = None,
-) -> Tuple[str, Optional[Dict[str, Any]]]:
+) -> Dict[str, Any]:
     if combine_spikes is None:
         raise RuntimeError("combine_spikes helper unavailable")
-    if (
-        average_inter_event_interval is None
-        or empty_bin_fraction is None
-        or branching_ratios_binned_global is None
-    ):
-        raise RuntimeError("Criticality metrics dependencies are missing")
 
     experiment_cfg = cfg.get("experiment") if isinstance(cfg, dict) else None
     stimulation_cfg = cfg.get("stimulation", {}) if isinstance(cfg, dict) else {}
@@ -235,7 +229,7 @@ def _compute_criticality_report(
         ["spikes_E", "spikes_IH", "spikes_IA"],
     )
     if not spikes_all:
-        raise ValueError("Spike data not available for criticality metrics")
+        raise ValueError("Spike data not available for analysis window")
 
     times_full = np.asarray(spikes_all.get("times"))
     senders_full = np.asarray(spikes_all.get("senders"))
@@ -255,6 +249,33 @@ def _compute_criticality_report(
         + net_cfg.get("N_IA_1", net_cfg.get("N_IA", 0))
         + net_cfg.get("N_IA_2", 0)
     )
+
+    return {
+        "times": times,
+        "t_start_ms": t_start_ms,
+        "t_stop_ms": t_stop_ms,
+        "N_total": N_total,
+    }
+
+
+def _compute_criticality_report(
+    run_dir: Path,
+    cfg: Dict[str, Any],
+    data: Dict[str, Any],
+    mr_dt_ms: Optional[float] = None,
+    analysis_inputs: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    if (
+        average_inter_event_interval is None
+        or empty_bin_fraction is None
+        or branching_ratios_binned_global is None
+    ):
+        raise RuntimeError("Criticality metrics dependencies are missing")
+    analysis = analysis_inputs or _prepare_analysis_inputs(cfg, data)
+    times = np.asarray(analysis.get("times"), dtype=float)
+    t_start_ms = float(analysis.get("t_start_ms", 0.0))
+    t_stop_ms = float(analysis.get("t_stop_ms", 0.0))
+    N_total = int(analysis.get("N_total", 0))
 
     aiei_ms, _ = average_inter_event_interval(
         times_ms=times,
@@ -409,6 +430,129 @@ def _compute_criticality_report(
     return "\n".join(lines), mr_plot_payload
 
 
+def _compute_avalanche_analysis(
+    cfg: Dict[str, Any],
+    data: Dict[str, Any],
+    *,
+    dt_ms: Optional[float] = None,
+    min_size: int = 2,
+    analysis_inputs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if avalanche_sizes_from_times is None:
+        raise RuntimeError("Avalanche helper unavailable")
+    if average_inter_event_interval is None:
+        raise RuntimeError("Average inter-event interval helper unavailable")
+
+    analysis = analysis_inputs or _prepare_analysis_inputs(cfg, data)
+    times = np.asarray(analysis.get("times"), dtype=float)
+    t_start_ms = float(analysis.get("t_start_ms", 0.0))
+    t_stop_ms = float(analysis.get("t_stop_ms", 0.0))
+
+    aiei_ms, _ = average_inter_event_interval(
+        times_ms=times,
+        t_start_ms=t_start_ms,
+        t_stop_ms=t_stop_ms,
+    )
+    if not np.isfinite(aiei_ms) or aiei_ms <= 0.0:
+        raise ValueError("Average inter-event interval unavailable for avalanche analysis")
+
+    bin_width_ms = float(dt_ms) if dt_ms and dt_ms > 0.0 else max(aiei_ms, 1e-3)
+
+    sizes, durations_ms = avalanche_sizes_from_times(
+        times_ms=times,
+        t_start_ms=t_start_ms,
+        t_stop_ms=t_stop_ms,
+        dt_ms=bin_width_ms,
+        min_size=min_size,
+    )
+    if sizes.size == 0 or durations_ms.size == 0:
+        raise ValueError("No avalanches detected for the selected window")
+
+    def _ccdf(values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        vals = np.sort(np.asarray(values, dtype=float))
+        if vals.size == 0:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        unique_vals, counts = np.unique(vals, return_counts=True)
+        survival_counts = np.cumsum(counts[::-1])[::-1]
+        survival = survival_counts / float(survival_counts[0])
+        return unique_vals, survival
+
+    def _fit_exponent(x: np.ndarray, y: np.ndarray) -> float:
+        mask = (x > 0.0) & (y > 0.0)
+        if np.count_nonzero(mask) < 2:
+            return float("nan")
+        logx = np.log10(x[mask])
+        logy = np.log10(y[mask])
+        try:
+            slope, _ = np.polyfit(logx, logy, 1)
+        except Exception:
+            return float("nan")
+        return 1.0 - slope
+
+    size_x, size_ccdf = _ccdf(sizes)
+    duration_x, duration_ccdf = _ccdf(durations_ms)
+    tau = _fit_exponent(size_x, size_ccdf)
+    alpha = _fit_exponent(duration_x, duration_ccdf)
+
+    duration_unique, inverse_indices = np.unique(durations_ms, return_inverse=True)
+    mean_sizes = np.zeros_like(duration_unique)
+    counts_per_duration = np.zeros_like(duration_unique)
+    for idx, s in zip(inverse_indices, sizes):
+        mean_sizes[idx] += s
+        counts_per_duration[idx] += 1.0
+    valid = counts_per_duration > 0
+    mean_sizes[valid] /= counts_per_duration[valid]
+
+    def _fit_beta(x_vals: np.ndarray, y_vals: np.ndarray) -> float:
+        mask = (x_vals > 0.0) & (y_vals > 0.0)
+        if np.count_nonzero(mask) < 2:
+            return float("nan")
+        logx = np.log10(x_vals[mask])
+        logy = np.log10(y_vals[mask])
+        try:
+            slope, _ = np.polyfit(logx, logy, 1)
+        except Exception:
+            return float("nan")
+        return float(slope)
+
+    beta_emp = _fit_beta(duration_unique, mean_sizes)
+    beta_pred = float("nan")
+    if np.isfinite(alpha) and np.isfinite(tau) and not math.isclose(tau, 1.0, rel_tol=1e-9):
+        beta_pred = (alpha - 1.0) / (tau - 1.0)
+
+    mask_scale = (duration_unique > 0.0) & (mean_sizes > 0.0)
+    predicted_sizes = np.full_like(mean_sizes, np.nan)
+    if np.isfinite(beta_pred) and np.any(mask_scale):
+        logx = np.log(duration_unique[mask_scale])
+        logy = np.log(mean_sizes[mask_scale])
+        intercept = float(np.mean(logy - beta_pred * logx))
+        predicted_sizes[mask_scale] = np.exp(intercept + beta_pred * logx)
+
+    dcc = abs(beta_emp - beta_pred) if np.isfinite(beta_emp) and np.isfinite(beta_pred) else float("nan")
+
+    return {
+        "dt_ms": float(bin_width_ms),
+        "tau": float(tau),
+        "alpha": float(alpha),
+        "beta_empirical": float(beta_emp),
+        "beta_predicted": float(beta_pred),
+        "dcc": float(dcc),
+        "size_ccdf": {
+            "x": size_x.tolist(),
+            "y": size_ccdf.tolist(),
+        },
+        "duration_ccdf": {
+            "x": duration_x.tolist(),
+            "y": duration_ccdf.tolist(),
+        },
+        "scaling": {
+            "duration_ms": duration_unique.tolist(),
+            "mean_size": mean_sizes.tolist(),
+            "predicted": predicted_sizes.tolist(),
+        },
+    }
+
+
 def load_run(run_path: str | None = None, *, mr_dt_ms: Optional[float] = None) -> Dict[str, Any]:
     """Load config, spikes, weights, and summary metrics for a run."""
     run_dir = Path(run_path) if run_path else None
@@ -527,16 +671,39 @@ def load_run(run_path: str | None = None, *, mr_dt_ms: Optional[float] = None) -
     criticality_markdown: Optional[str] = None
     criticality_mr_plot: Optional[Dict[str, Any]] = None
     criticality_error: Optional[str] = None
+    avalanche_analysis: Optional[Dict[str, Any]] = None
+    avalanche_error: Optional[str] = None
+
+    analysis_inputs: Optional[Dict[str, Any]] = None
+    analysis_error: Optional[str] = None
     if cfg and data:
+        try:
+            analysis_inputs = _prepare_analysis_inputs(cfg, data)
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            analysis_error = str(exc)
+
+    if cfg and data and analysis_inputs is not None:
         try:
             criticality_markdown, criticality_mr_plot = _compute_criticality_report(
                 run_dir,
                 cfg,
                 data,
                 mr_dt_ms=mr_dt_ms,
+                analysis_inputs=analysis_inputs,
             )
         except Exception as exc:  # pragma: no cover - diagnostics only
             criticality_error = str(exc)
+        try:
+            avalanche_analysis = _compute_avalanche_analysis(
+                cfg,
+                data,
+                analysis_inputs=analysis_inputs,
+            )
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            avalanche_error = str(exc)
+    elif analysis_error:
+        criticality_error = criticality_error or analysis_error
+        avalanche_error = avalanche_error or analysis_error
 
     return {
         "config": cfg,
@@ -552,6 +719,8 @@ def load_run(run_path: str | None = None, *, mr_dt_ms: Optional[float] = None) -
         "criticality_markdown": criticality_markdown,
         "criticality_mr_regression": criticality_mr_plot,
         "criticality_error": criticality_error,
+        "avalanche_analysis": avalanche_analysis,
+        "avalanche_error": avalanche_error,
     }
 
 
