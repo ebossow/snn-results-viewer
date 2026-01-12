@@ -297,7 +297,7 @@ def _compute_criticality_report(
     for factor in dt_factors:
         dt_raw = float(factor * aiei_ms)
         dt_candidates.append(max(dt_raw, dt_min_ms))
-    # Allow dedicated MR plot dt (1 ms) even if below dt_min.
+    # Allow dedicated MR plot dt and explicit 1–7 ms sweep even if below dt_min.
     final_dt_values: List[float] = []
 
     def _append_unique(value: float) -> None:
@@ -313,6 +313,10 @@ def _compute_criticality_report(
         _append_unique(value)
 
     _append_unique(effective_mr_dt)
+
+    explicit_dt_values = [float(ms) for ms in range(1, 8)]
+    for value in explicit_dt_values:
+        _append_unique(value)
 
     def _fmt_or_na(value: float) -> str:
         return f"{value:.3f}" if np.isfinite(value) else "n/a"
@@ -339,8 +343,13 @@ def _compute_criticality_report(
         tau_mr = np.nan
         coeffs = None
         fit_result = None
-        wants_plot_details = mr_available and math.isclose(dt_ms, effective_mr_dt, rel_tol=1e-9, abs_tol=1e-9)
-        if mr_available and wants_plot_details:
+        wants_plot_details = mr_available and math.isclose(
+            dt_ms,
+            effective_mr_dt,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+        if mr_available:
             try:
                 result = branching_ratio_mr_estimator(
                     spike_counts=counts,
@@ -360,10 +369,6 @@ def _compute_criticality_report(
                 tau_mr = np.nan
                 coeffs = None
                 fit_result = None
-        elif mr_available:
-            # Skip MR computation for other dt values
-            sigma_mr = np.nan
-            tau_mr = np.nan
 
         dt_over_aiei = dt_ms / aiei_ms
         lines.append(
