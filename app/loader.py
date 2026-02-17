@@ -51,6 +51,32 @@ for candidate in (THESIS_REPO_PATH, THESIS_SRC_PATH):
     if candidate not in sys.path:
         sys.path.insert(0, candidate)
 
+_DEFAULT_RESULTS_ROOTS: List[Path] = [Path(THESIS_REPO_PATH) / "results"]
+_DEFAULT_RESULTS_ROOTS.append(Path("/Volumes/X9Pro/Backup Bachelor/260126"))
+
+_extra_roots = os.environ.get("SNN_RESULTS_VIEWER_EXTRA_RESULTS_PATHS", "")
+if _extra_roots:
+    for part in _extra_roots.split(os.pathsep):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        candidate = Path(cleaned).expanduser()
+        if candidate not in _DEFAULT_RESULTS_ROOTS:
+            _DEFAULT_RESULTS_ROOTS.append(candidate)
+
+
+def get_default_results_roots() -> List[str]:
+    """Return expanded default results roots for UI helpers."""
+    roots: List[str] = []
+    seen: set[str] = set()
+    for candidate in _DEFAULT_RESULTS_ROOTS:
+        expanded = str(candidate.expanduser())
+        if expanded in seen:
+            continue
+        seen.add(expanded)
+        roots.append(expanded)
+    return roots
+
 try:  # Optional imports – available once the thesis repo is accessible
     from analysis.util import (  # type: ignore
         load_run as thesis_load_run,
@@ -89,10 +115,15 @@ except Exception:  # pragma: no cover - optional dependency
 
 def _resolve_results_root(results_root: Optional[str]) -> Path:
     if results_root:
-        root = Path(results_root).expanduser()
-    else:
-        root = Path(THESIS_REPO_PATH) / "results"
-    return root
+        return Path(results_root).expanduser()
+
+    for candidate in _DEFAULT_RESULTS_ROOTS:
+        expanded = candidate.expanduser()
+        if expanded.exists():
+            return expanded
+
+    # Fall back to the first configured candidate even if it does not exist yet.
+    return _DEFAULT_RESULTS_ROOTS[0].expanduser()
 
 
 def _looks_like_run_folder(path: Path) -> bool:

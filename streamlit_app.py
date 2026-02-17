@@ -301,7 +301,11 @@ def render_avalanche_analysis(analysis: Dict[str, Any]) -> None:
 
 st.title("SNN Results Viewer")
 
-default_results_root = str(Path(loader.THESIS_REPO_PATH) / "results")
+default_root_candidates = loader.get_default_results_roots()
+if default_root_candidates:
+    default_results_root = default_root_candidates[0]
+else:
+    default_results_root = str(Path(loader.THESIS_REPO_PATH) / "results")
 
 if "results_root_text" not in st.session_state:
     st.session_state["results_root_text"] = default_results_root
@@ -321,6 +325,14 @@ def _set_current_root(path: str) -> None:
 
 if results_root_input != st.session_state["results_root_text"]:
     _set_current_root(results_root_input)
+
+if default_root_candidates:
+    quick_placeholder = f"Current: {st.session_state['current_results_root']}"
+    quick_options = [quick_placeholder] + default_root_candidates
+    quick_selection = st.sidebar.selectbox("Quick results roots", quick_options, index=0)
+    if quick_selection != quick_placeholder:
+        _set_current_root(quick_selection)
+        _trigger_rerun()
 
 refresh_requested = st.sidebar.button("Refresh runs")
 
