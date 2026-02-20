@@ -35,6 +35,7 @@ MR_FIT_MIN_MS = 10.0
 MR_FIT_MAX_MS = 60.0
 MR_MIN_FIT_POINTS = 3
 MR_FIT_USE_OFFSET = False
+DEFAULT_POST_LEARNING_WINDOW_MS = 45_000.0
 
 # Path to your thesis codebase (source of truth for data/analysis).
 # Override via the SNN_RESULTS_VIEWER_THESIS_PATH environment variable when
@@ -43,6 +44,7 @@ THESIS_REPO_PATH = os.environ.get(
     "SNN_RESULTS_VIEWER_THESIS_PATH",
     "/Users/erik/Documents/Uni/Bachelor Thesis/CodeBase",
 )
+CRITICALITY_ANALYSIS_ROOT = Path(THESIS_REPO_PATH) / "results" / "criticality_analysis"
 
 # Ensure quick sys.path import works for prototypes. For a robust setup prefer
 # editable install (pip install -e) inside the thesis repo.
@@ -153,6 +155,76 @@ def _read_yaml(path: Path) -> Dict[str, Any]:
         return {}
     with path.open("r") as f:
         return yaml.safe_load(f) or {}
+
+
+def _infer_learning_end_ms(cfg: Dict[str, Any], simtime_ms: float) -> float:
+    """Infer when learning/stimulation phase ends from resolved config."""
+    stimulation_cfg = cfg.get("stimulation", {}) if isinstance(cfg, dict) else {}
+    pattern_cfg = stimulation_cfg.get("pattern", {}) if isinstance(stimulation_cfg, dict) else {}
+    dc_cfg = stimulation_cfg.get("dc", {}) if isinstance(stimulation_cfg, dict) else {}
+
+    candidate_values = [
+        pattern_cfg.get("t_off_ms"),
+        dc_cfg.get("t_off_ms"),
+        stimulation_cfg.get("t_off_ms") if isinstance(stimulation_cfg, dict) else None,
+        cfg.get("learning_end_ms") if isinstance(cfg, dict) else None,
+    ]
+
+    for value in candidate_values:
+        if value is None:
+            continue
+        try:
+            learning_end = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(learning_end):
+            return float(min(max(learning_end, 0.0), simtime_ms))
+
+    return 0.0
+
+
+def get_run_analysis_window_defaults(
+    run_path: str | None,
+    default_window_ms: float = DEFAULT_POST_LEARNING_WINDOW_MS,
+) -> Dict[str, float]:
+    """Return simtime/learning-end and default analysis window for a run."""
+    if run_path is None:
+        return {
+            "simtime_ms": 0.0,
+            "learning_end_ms": 0.0,
+            "default_start_ms": 0.0,
+            "default_stop_ms": 0.0,
+        }
+
+    run_dir = Path(run_path)
+    cfg = _read_yaml(run_dir / "config_resolved.yaml")
+    if not cfg:
+        cfg = _read_yaml(run_dir / "config.yaml")
+
+    experiment_cfg = cfg.get("experiment", {}) if isinstance(cfg, dict) else {}
+    simtime_raw = experiment_cfg.get("simtime_ms", 0.0)
+    try:
+        simtime_ms = float(simtime_raw)
+    except (TypeError, ValueError):
+        simtime_ms = 0.0
+    if not np.isfinite(simtime_ms) or simtime_ms < 0.0:
+        simtime_ms = 0.0
+
+    learning_end_ms = _infer_learning_end_ms(cfg, simtime_ms)
+    start_ms = learning_end_ms
+    window_ms = max(float(default_window_ms), 0.0)
+    stop_ms = min(simtime_ms, start_ms + window_ms)
+
+    if stop_ms <= start_ms:
+        start_ms = 0.0
+        stop_ms = simtime_ms
+
+    return {
+        "simtime_ms": float(simtime_ms),
+        "learning_end_ms": float(learning_end_ms),
+        "default_start_ms": float(start_ms),
+        "default_stop_ms": float(stop_ms),
+    }
 
 
 def _collect_file_info(run_dir: Path) -> List[Dict[str, Any]]:
@@ -302,29 +374,33 @@ def _compute_dcc(tau_size: float, tau_duration: float, gamma_fitted: float) -> T
 def _prepare_analysis_inputs(
     cfg: Dict[str, Any],
     data: Dict[str, Any],
+    analysis_start_ms: Optional[float] = None,
+    analysis_stop_ms: Optional[float] = None,
+    default_window_ms: float = DEFAULT_POST_LEARNING_WINDOW_MS,
 ) -> Dict[str, Any]:
     if combine_spikes is None:
         raise RuntimeError("combine_spikes helper unavailable")
 
     experiment_cfg = cfg.get("experiment") if isinstance(cfg, dict) else None
-    stimulation_cfg = cfg.get("stimulation", {}) if isinstance(cfg, dict) else {}
     if not experiment_cfg:
         raise ValueError("Experiment configuration missing")
 
     simtime_ms = float(experiment_cfg.get("simtime_ms", 0.0))
-    t_start_ms = 0.0
-    t_stop_ms = simtime_ms
+    learning_end_ms = _infer_learning_end_ms(cfg, simtime_ms)
 
-    pattern_cfg = stimulation_cfg.get("pattern", {}) if isinstance(stimulation_cfg, dict) else {}
-    dc_cfg = stimulation_cfg.get("dc", {}) if isinstance(stimulation_cfg, dict) else {}
-    dc_enabled = bool(dc_cfg.get("enabled", False))
+    t_start_default = learning_end_ms
+    t_stop_default = min(simtime_ms, t_start_default + max(float(default_window_ms), 0.0))
+    if t_stop_default <= t_start_default:
+        t_start_default = 0.0
+        t_stop_default = simtime_ms
 
-    if dc_enabled:
-        t_off_val = pattern_cfg.get("t_off_ms")
-        if t_off_val is None:
-            t_off_val = dc_cfg.get("t_off_ms", t_stop_ms)
-        t_off_ms = float(t_off_val)
-        t_start_ms = min(max(t_off_ms, 0.0), t_stop_ms)
+    t_start_ms = t_start_default if analysis_start_ms is None else float(analysis_start_ms)
+    t_stop_ms = t_stop_default if analysis_stop_ms is None else float(analysis_stop_ms)
+    t_start_ms = min(max(t_start_ms, 0.0), simtime_ms)
+    t_stop_ms = min(max(t_stop_ms, 0.0), simtime_ms)
+
+    if t_stop_ms <= t_start_ms:
+        raise ValueError("Invalid analysis window: stop must be greater than start")
 
     spikes_all = combine_spikes(
         data,
@@ -356,6 +432,7 @@ def _prepare_analysis_inputs(
         "times": times,
         "t_start_ms": t_start_ms,
         "t_stop_ms": t_stop_ms,
+        "learning_end_ms": learning_end_ms,
         "N_total": N_total,
     }
 
@@ -629,7 +706,185 @@ def _compute_avalanche_analysis(
     }
 
 
-def load_run(run_path: str | None = None, *, mr_dt_ms: Optional[float] = None) -> Dict[str, Any]:
+def _safe_scalar(value: Any, default: float = float("nan")) -> float:
+    try:
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return default
+            return float(np.asarray(value).reshape(-1)[0])
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _window_name_for_analysis(analysis_inputs: Dict[str, Any]) -> Optional[str]:
+    start_ms = float(analysis_inputs.get("t_start_ms", 0.0))
+    stop_ms = float(analysis_inputs.get("t_stop_ms", 0.0))
+    learning_end_ms = float(analysis_inputs.get("learning_end_ms", 0.0))
+
+    if stop_ms <= learning_end_ms:
+        return "pre_learning"
+    if start_ms >= learning_end_ms:
+        return "post_learning"
+    return None
+
+
+def _iter_precomputed_run_dirs(root: Path) -> List[Path]:
+    run_dirs: List[Path] = []
+    if not root.exists():
+        return run_dirs
+
+    for experiment_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        for candidate in sorted(p for p in experiment_dir.iterdir() if p.is_dir()):
+            if (candidate / "branching").is_dir() or (candidate / "avalanche").is_dir():
+                run_dirs.append(candidate)
+    return run_dirs
+
+
+def _match_precomputed_run_dir(run_dir: Path, root: Path) -> Optional[Path]:
+    run_name = run_dir.name.lower()
+    candidates = _iter_precomputed_run_dirs(root)
+    if not candidates:
+        return None
+
+    best: Optional[Tuple[int, Path]] = None
+    for candidate in candidates:
+        cname = candidate.name.lower()
+        score: Optional[int] = None
+        if cname == run_name or cname == f"{run_name}_analysis":
+            score = 0
+        elif cname.replace("_analysis", "") == run_name:
+            score = 1
+        elif run_name in cname:
+            score = 2
+
+        if score is None:
+            continue
+
+        if best is None or score < best[0]:
+            best = (score, candidate)
+
+    return best[1] if best else None
+
+
+def _load_npz_if_exists(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.is_file():
+        return None
+    try:
+        return _load_npz_arrays(path, allow_pickle=True)
+    except Exception:
+        return None
+
+
+def _load_precomputed_criticality(
+    run_dir: Path,
+    analysis_inputs: Dict[str, Any],
+    root: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    criticality_root = (root or CRITICALITY_ANALYSIS_ROOT).expanduser()
+    matched_run = _match_precomputed_run_dir(run_dir, criticality_root)
+    if matched_run is None:
+        return None
+
+    window_name = _window_name_for_analysis(analysis_inputs)
+    if not window_name:
+        return None
+
+    branching_npz = _load_npz_if_exists(
+        matched_run / "branching" / "whole_population" / window_name / "metrics.npz"
+    )
+    avalanche_npz = _load_npz_if_exists(
+        matched_run / "avalanche" / "whole_population" / window_name / "metrics.npz"
+    )
+
+    if branching_npz is None and avalanche_npz is None:
+        return None
+
+    alpha_idx = 0
+    beta_idx = 0
+    if branching_npz is not None:
+        alphas = np.asarray(branching_npz.get("alphas", []), dtype=float)
+        betas = np.asarray(branching_npz.get("betas", []), dtype=float)
+        if alphas.size:
+            alpha_idx = int(np.argmin(np.abs(alphas - 1.0)))
+        if betas.size:
+            beta_idx = int(np.argmin(np.abs(betas - 1.0)))
+    elif avalanche_npz is not None:
+        alphas = np.asarray(avalanche_npz.get("alphas", []), dtype=float)
+        betas = np.asarray(avalanche_npz.get("betas", []), dtype=float)
+        if alphas.size:
+            alpha_idx = int(np.argmin(np.abs(alphas - 1.0)))
+        if betas.size:
+            beta_idx = int(np.argmin(np.abs(betas - 1.0)))
+
+    def _matrix_value(data: Dict[str, Any], key: str) -> float:
+        arr = np.asarray(data.get(key, np.nan), dtype=float)
+        if arr.ndim == 2 and arr.size:
+            i = min(max(alpha_idx, 0), arr.shape[0] - 1)
+            j = min(max(beta_idx, 0), arr.shape[1] - 1)
+            return float(arr[i, j])
+        if arr.ndim == 0:
+            return _safe_scalar(arr)
+        return float("nan")
+
+    lines = [
+        f"**Source:** precomputed metrics (`{matched_run}`)",
+        f"**Window:** {window_name}",
+    ]
+    criticality_mr_plot: Optional[Dict[str, Any]] = None
+
+    if branching_npz is not None:
+        sigma_mr = _matrix_value(branching_npz, "sigma_mr")
+        tau_mr_ms = _matrix_value(branching_npz, "tau_mr_ms")
+        dt_mr_ms = _safe_scalar(branching_npz.get("dt_mr_ms"))
+        lines.extend(
+            [
+                f"**σ_MR (α≈1, β≈1):** {sigma_mr:.3f}" if np.isfinite(sigma_mr) else "**σ_MR (α≈1, β≈1):** n/a",
+                f"**τ_MR (ms):** {tau_mr_ms:.3f}" if np.isfinite(tau_mr_ms) else "**τ_MR (ms):** n/a",
+                f"**MR dt (ms):** {dt_mr_ms:.3f}" if np.isfinite(dt_mr_ms) else "**MR dt (ms):** n/a",
+            ]
+        )
+
+    avalanche_analysis: Optional[Dict[str, Any]] = None
+    if avalanche_npz is not None:
+        tau_size = _matrix_value(avalanche_npz, "tau_size")
+        tau_duration = _matrix_value(avalanche_npz, "tau_duration")
+        beta_emp = _matrix_value(avalanche_npz, "gamma_fitted")
+        beta_pred = _matrix_value(avalanche_npz, "gamma_pred")
+        dcc = _matrix_value(avalanche_npz, "dcc")
+        dt_avalanche_ms = _matrix_value(avalanche_npz, "dt_avalanche_ms")
+        if not np.isfinite(dt_avalanche_ms):
+            dt_avalanche_ms = _safe_scalar(avalanche_npz.get("dt_mr_ms"))
+
+        avalanche_analysis = {
+            "dt_ms": dt_avalanche_ms,
+            "tau": tau_size,
+            "alpha": tau_duration,
+            "beta_empirical": beta_emp,
+            "beta_predicted": beta_pred,
+            "dcc": dcc,
+            "size_ccdf": {"x": [], "y": []},
+            "duration_ccdf": {"x": [], "y": []},
+            "scaling": {"duration_ms": [], "mean_size": [], "predicted": []},
+        }
+
+    return {
+        "criticality_markdown": "\n".join(lines),
+        "criticality_mr_regression": criticality_mr_plot,
+        "avalanche_analysis": avalanche_analysis,
+        "source_path": str(matched_run),
+        "window_name": window_name,
+    }
+
+
+def load_run(
+    run_path: str | None = None,
+    *,
+    mr_dt_ms: Optional[float] = None,
+    analysis_start_ms: Optional[float] = None,
+    analysis_stop_ms: Optional[float] = None,
+    default_window_ms: float = DEFAULT_POST_LEARNING_WINDOW_MS,
+) -> Dict[str, Any]:
     """Load config, spikes, weights, and summary metrics for a run."""
     run_dir = Path(run_path) if run_path else None
     if run_dir is None or not run_dir.exists():
@@ -749,34 +1004,50 @@ def load_run(run_path: str | None = None, *, mr_dt_ms: Optional[float] = None) -
     criticality_error: Optional[str] = None
     avalanche_analysis: Optional[Dict[str, Any]] = None
     avalanche_error: Optional[str] = None
+    criticality_source: str = "computed"
+    criticality_source_path: Optional[str] = None
 
     analysis_inputs: Optional[Dict[str, Any]] = None
     analysis_error: Optional[str] = None
     if cfg and data:
         try:
-            analysis_inputs = _prepare_analysis_inputs(cfg, data)
+            analysis_inputs = _prepare_analysis_inputs(
+                cfg,
+                data,
+                analysis_start_ms=analysis_start_ms,
+                analysis_stop_ms=analysis_stop_ms,
+                default_window_ms=default_window_ms,
+            )
         except Exception as exc:  # pragma: no cover - diagnostics only
             analysis_error = str(exc)
 
     if cfg and data and analysis_inputs is not None:
-        try:
-            criticality_markdown, criticality_mr_plot = _compute_criticality_report(
-                run_dir,
-                cfg,
-                data,
-                mr_dt_ms=mr_dt_ms,
-                analysis_inputs=analysis_inputs,
-            )
-        except Exception as exc:  # pragma: no cover - diagnostics only
-            criticality_error = str(exc)
-        try:
-            avalanche_analysis = _compute_avalanche_analysis(
-                cfg,
-                data,
-                analysis_inputs=analysis_inputs,
-            )
-        except Exception as exc:  # pragma: no cover - diagnostics only
-            avalanche_error = str(exc)
+        precomputed = _load_precomputed_criticality(run_dir, analysis_inputs)
+        if precomputed is not None:
+            criticality_markdown = precomputed.get("criticality_markdown")
+            criticality_mr_plot = precomputed.get("criticality_mr_regression")
+            avalanche_analysis = precomputed.get("avalanche_analysis")
+            criticality_source = "precomputed"
+            criticality_source_path = precomputed.get("source_path")
+        else:
+            try:
+                criticality_markdown, criticality_mr_plot = _compute_criticality_report(
+                    run_dir,
+                    cfg,
+                    data,
+                    mr_dt_ms=mr_dt_ms,
+                    analysis_inputs=analysis_inputs,
+                )
+            except Exception as exc:  # pragma: no cover - diagnostics only
+                criticality_error = str(exc)
+            try:
+                avalanche_analysis = _compute_avalanche_analysis(
+                    cfg,
+                    data,
+                    analysis_inputs=analysis_inputs,
+                )
+            except Exception as exc:  # pragma: no cover - diagnostics only
+                avalanche_error = str(exc)
     elif analysis_error:
         criticality_error = criticality_error or analysis_error
         avalanche_error = avalanche_error or analysis_error
@@ -795,8 +1066,16 @@ def load_run(run_path: str | None = None, *, mr_dt_ms: Optional[float] = None) -
         "criticality_markdown": criticality_markdown,
         "criticality_mr_regression": criticality_mr_plot,
         "criticality_error": criticality_error,
+        "criticality_source": criticality_source,
+        "criticality_source_path": criticality_source_path,
         "avalanche_analysis": avalanche_analysis,
         "avalanche_error": avalanche_error,
+        "analysis_window": {
+            "start_ms": float(analysis_inputs.get("t_start_ms", 0.0)) if analysis_inputs else None,
+            "stop_ms": float(analysis_inputs.get("t_stop_ms", 0.0)) if analysis_inputs else None,
+            "learning_end_ms": float(analysis_inputs.get("learning_end_ms", 0.0)) if analysis_inputs else None,
+            "default_window_ms": float(default_window_ms),
+        },
     }
 
 

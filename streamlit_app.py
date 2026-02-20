@@ -147,7 +147,12 @@ def render_file_preview(file_info: Dict[str, Any]) -> None:
         st.error(f"Failed to preview file: {exc}")
 
 
-def render_spike_raster(data: Dict[str, Any], cfg: Dict[str, Any]) -> None:
+def render_spike_raster(
+    data: Dict[str, Any],
+    cfg: Dict[str, Any],
+    window_start_ms: float | None = None,
+    window_stop_ms: float | None = None,
+) -> None:
     spikes_E = data.get("spikes_E")
     spikes_IH = data.get("spikes_IH")
     spikes_IA = data.get("spikes_IA")
@@ -164,6 +169,12 @@ def render_spike_raster(data: Dict[str, Any], cfg: Dict[str, Any]) -> None:
         senders = np.asarray(spikes.get("senders"))
         if times.size == 0 or senders.size == 0:
             return False
+        if window_start_ms is not None and window_stop_ms is not None:
+            mask = (times >= window_start_ms) & (times <= window_stop_ms)
+            times = times[mask]
+            senders = senders[mask]
+            if times.size == 0 or senders.size == 0:
+                return False
         ax.scatter(times, senders - 1, s=4, c=color, label=label)
         return True
 
@@ -176,6 +187,10 @@ def render_spike_raster(data: Dict[str, Any], cfg: Dict[str, Any]) -> None:
             continue
         times = np.asarray(spikes.get("times"))
         senders = np.asarray(spikes.get("senders"))
+        if window_start_ms is not None and window_stop_ms is not None:
+            mask = (times >= window_start_ms) & (times <= window_stop_ms)
+            times = times[mask]
+            senders = senders[mask]
         if times.size == 0 or senders.size == 0:
             continue
         inhib_times.append(times)
@@ -190,9 +205,12 @@ def render_spike_raster(data: Dict[str, Any], cfg: Dict[str, Any]) -> None:
             label="Inhibitory (IH/IA)",
         )
 
-    simtime = cfg.get("experiment", {}).get("simtime_ms")
-    if isinstance(simtime, (int, float)):
-        ax.set_xlim(0, simtime)
+    if window_start_ms is not None and window_stop_ms is not None:
+        ax.set_xlim(window_start_ms, window_stop_ms)
+    else:
+        simtime = cfg.get("experiment", {}).get("simtime_ms")
+        if isinstance(simtime, (int, float)):
+            ax.set_xlim(0, simtime)
     ax.set_xlabel("time (ms)")
     ax.set_ylabel("neuron index (GID)")
     ax.set_title("Spike raster")
@@ -416,11 +434,51 @@ with nav_container:
 
 selected_run_info = run_options[run_index]["info"]
 
-run_details = loader.load_run(selected_run_info['path'])
+window_defaults = loader.get_run_analysis_window_defaults(selected_run_info['path'])
+simtime_ms = float(window_defaults.get("simtime_ms", 0.0))
+default_start_ms = float(window_defaults.get("default_start_ms", 0.0))
+default_stop_ms = float(window_defaults.get("default_stop_ms", simtime_ms))
+learning_end_ms = float(window_defaults.get("learning_end_ms", 0.0))
+
+window_state_key = f"analysis_window_ms::{selected_run_info['path']}"
+if window_state_key not in st.session_state:
+    st.session_state[window_state_key] = (default_start_ms, default_stop_ms)
+
+if simtime_ms > 0.0:
+    current_start_ms, current_stop_ms = st.session_state[window_state_key]
+    clamped_start_ms = min(max(float(current_start_ms), 0.0), simtime_ms)
+    clamped_stop_ms = min(max(float(current_stop_ms), 0.0), simtime_ms)
+    if clamped_stop_ms <= clamped_start_ms:
+        clamped_start_ms, clamped_stop_ms = default_start_ms, default_stop_ms
+
+    selected_window_s = st.slider(
+        "Analysis window (seconds)",
+        min_value=0.0,
+        max_value=float(simtime_ms / 1000.0),
+        value=(float(clamped_start_ms / 1000.0), float(clamped_stop_ms / 1000.0)),
+        step=1.0,
+    )
+    analysis_start_ms = float(selected_window_s[0] * 1000.0)
+    analysis_stop_ms = float(selected_window_s[1] * 1000.0)
+    st.session_state[window_state_key] = (analysis_start_ms, analysis_stop_ms)
+    st.caption(
+        "Default inferred from config_resolved: 45s after learning end "
+        f"(learning end ≈ {learning_end_ms / 1000.0:.1f}s)."
+    )
+else:
+    analysis_start_ms = None
+    analysis_stop_ms = None
+
+run_details = loader.load_run(
+    selected_run_info['path'],
+    analysis_start_ms=analysis_start_ms,
+    analysis_stop_ms=analysis_stop_ms,
+)
 metadata = run_details.get('metadata') or {}
 config = run_details.get('config') or {}
 summary = run_details.get('summary') or {}
 data = run_details.get('data') or {}
+analysis_window = run_details.get('analysis_window') or {}
 
 debug_avalanche = run_details.get('avalanche_analysis') or {}
 st.sidebar.caption(
@@ -434,6 +492,10 @@ with st.expander("Run overview", expanded=True):
     sim_time = config.get('experiment', {}).get('simtime_ms')
     col_c.metric("Simtime (ms)", sim_time if sim_time is not None else "n/a")
     st.caption(f"Path: {selected_run_info['path']}")
+    start_ms = analysis_window.get("start_ms")
+    stop_ms = analysis_window.get("stop_ms")
+    if isinstance(start_ms, (int, float)) and isinstance(stop_ms, (int, float)):
+        st.caption(f"Active analysis window: {start_ms:.0f}–{stop_ms:.0f} ms")
 
 with st.expander("Summary metrics", expanded=False):
     if isinstance(summary, dict) and summary:
@@ -450,10 +512,16 @@ with st.expander("Summary metrics", expanded=False):
 criticality_markdown = run_details.get('criticality_markdown')
 criticality_error = run_details.get('criticality_error')
 criticality_mr_plot = run_details.get('criticality_mr_regression')
+criticality_source = run_details.get('criticality_source', 'computed')
+criticality_source_path = run_details.get('criticality_source_path')
 avalanche_analysis = run_details.get('avalanche_analysis')
 avalanche_error = run_details.get('avalanche_error')
 
 with st.expander("Criticality metrics", expanded=False):
+    if criticality_source == "precomputed":
+        st.caption(f"Using precomputed criticality metrics from: {criticality_source_path}")
+    else:
+        st.caption("Using on-the-fly criticality computation for current analysis window.")
     if criticality_markdown:
         if criticality_mr_plot:
             table_col, plot_col = st.columns((3, 2))
@@ -503,7 +571,12 @@ with st.expander("Visualizations", expanded=True):
     col_raster, col_weight = st.columns(2)
     with col_raster:
         st.markdown("#### Spike raster")
-        render_spike_raster(data, config)
+        render_spike_raster(
+            data,
+            config,
+            window_start_ms=analysis_window.get("start_ms"),
+            window_stop_ms=analysis_window.get("stop_ms"),
+        )
     with col_weight:
         st.markdown("#### Weight matrix")
         render_weight_matrix(
